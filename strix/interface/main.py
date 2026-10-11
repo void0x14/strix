@@ -64,6 +64,7 @@ Additional commands:
   strix cloud ...          Use the managed Strix platform
   strix auth ...           Manage model-subscription sign-in
   strix view [RUN]         View a completed or running scan
+  strix fleet ...          Scan many targets in parallel with a live web view
   strix completions SHELL  Generate zsh, bash, or fish tab completion
 """
 
@@ -447,6 +448,14 @@ def main() -> None:
 
         run_view(sys.argv[2:])
         return
+
+    # `strix fleet …` scans every target in a file in parallel under a memory
+    # budget and serves one live web view over the whole fleet; it owns its own
+    # argument parsing and never enters the single-scan path.
+    if len(sys.argv) > 1 and sys.argv[1] == "fleet":
+        from strix.interface.fleet import run_fleet
+
+        sys.exit(run_fleet(sys.argv[2:]))
 
     # `strix auth …` manages model-subscription sign-in and exits; it needs no
     # target, Docker, or scan setup.

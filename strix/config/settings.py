@@ -30,6 +30,14 @@ class LlmSettings(BaseSettings):
     model_config = _BASE_CONFIG
 
     model: str | None = Field(default=None, alias="STRIX_LLM")
+    emergency_model: str | None = Field(
+        default=None,
+        alias="STRIX_EMERGENCY_LLM",
+        description=(
+            "Model slug to fail over to when the primary model is unreachable. It is "
+            "resolved through the same endpoint (LLM_API_BASE) as the primary model."
+        ),
+    )
     api_type: ApiType | None = Field(
         default=None,
         validation_alias=AliasChoices("STRIX_API_TYPE", "STRIX_FORCE_API"),

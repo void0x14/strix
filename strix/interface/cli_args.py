@@ -56,6 +56,21 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def validate_run_name(name: str) -> str:
+    """Reject a run name that could escape ``strix_runs/``.
+
+    The name becomes a directory under the runs root, and it is accepted from a
+    command line, so it is constrained to a single safe path segment rather than
+    trusted: no separators, no traversal, no leading dot.
+    """
+    candidate = name.strip()
+    if not candidate or candidate in {".", ".."} or candidate.startswith("."):
+        raise ValueError(f"invalid run name {name!r}")
+    if any(sep and sep in candidate for sep in ("/", "\\", "\0")):
+        raise ValueError(f"run name must be a single path segment: {name!r}")
+    return candidate
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Strix Multi-Agent Cybersecurity Penetration Testing Tool",
@@ -313,6 +328,19 @@ Strix Cloud:
         ),
     )
 
+    parser.add_argument(
+        "--run-name",
+        dest="run_name_arg",
+        type=str,
+        metavar="NAME",
+        help=(
+            "Use this run name (the directory under ./strix_runs/) instead of a "
+            "generated one. Cannot be combined with --resume, which carries its own "
+            "name. Reusing a name targets the existing run directory, so a caller that "
+            "needs one run directory per target (a fleet launch) gets a stable path."
+        ),
+    )
+
     args = parser.parse_args()
     # Startup-resolved state lives alongside the parsed flags. The full schema
     # is established here so downstream code reads attributes directly.
@@ -322,6 +350,11 @@ Strix Cloud:
     args.local_sources = []
     args.diff_scope = {"active": False}
     args.run_name = None
+    if args.run_name_arg:
+        try:
+            args.run_name = validate_run_name(args.run_name_arg)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     if args.config:
         apply_config_override(validate_config_file(args.config))
@@ -381,6 +414,8 @@ Strix Cloud:
                 "--resume picks up where the prior run left off, including the "
                 "original target list."
             )
+        if args.run_name:
+            parser.error("Cannot combine --resume with --run-name; --resume names its own run.")
         if not args.resume.strip():
             # A bare --resume: main() opens the inline picker of prior runs
             # before anything launches; headless has nobody to pick, so it

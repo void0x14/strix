@@ -27,7 +27,7 @@ from strix.config.models import (
     supports_strict_tool_schemas,
     uses_chat_completions_tool_schema,
 )
-from strix.config.settings import DEFAULT_MAX_TURNS
+from strix.config.settings import DEFAULT_MAX_TURNS, Settings
 from strix.core.agents import AgentCoordinator, BudgetPolicy
 from strix.core.execution import (
     respawn_subagents,
@@ -42,6 +42,12 @@ from strix.core.inputs import (
     build_scan_targets,
     build_scope_context,
     make_model_settings,
+)
+from strix.core.model_failover import (
+    FailoverController,
+    FailoverDecision,
+    FailoverModelProvider,
+    notify_operator,
 )
 from strix.core.paths import run_dir_for, runtime_state_dir
 from strix.core.sessions import open_agent_session
@@ -130,6 +136,101 @@ def _note_exit_reason(reason: str) -> None:
     report_state = get_global_report_state()
     if report_state is not None and report_state.scan_ended_exit_reason is None:
         report_state.scan_ended_exit_reason = reason
+
+
+def _model_provider(
+    settings: Settings,
+    resolved_model: str,
+    scan_id: str,
+    run_dir: Path,
+) -> Any:
+    """The run's model provider, with outage failover when an emergency model is set.
+
+    With no ``STRIX_EMERGENCY_LLM`` configured the provider is the plain
+    :class:`StrixProvider`, so nothing about an ordinary run changes. When one is
+    configured, every model call the run makes (root and sub-agents alike, since
+    the run config is shared) goes through one :class:`FailoverModelProvider`
+    bound to the same endpoint: the emergency model is only a different slug on
+    the same base URL, so a failover can never drift to a direct provider host.
+    """
+    provider = StrixProvider()
+    emergency = (getattr(settings.llm, "emergency_model", None) or "").strip()
+    if not emergency:
+        return provider
+    controller = FailoverController(primary=resolved_model, emergency=emergency)
+    logger.info(
+        "Model failover armed: primary=%s emergency=%s (same endpoint)",
+        resolved_model,
+        emergency,
+    )
+
+    async def _on_exhausted(decision: FailoverDecision) -> None:
+        await _handle_model_outage(scan_id, run_dir, controller, decision)
+
+    return FailoverModelProvider(provider, controller, on_exhausted=_on_exhausted)
+
+
+async def _handle_model_outage(
+    scan_id: str,
+    run_dir: Path,
+    controller: FailoverController,
+    decision: FailoverDecision,
+) -> None:
+    """Persist everything and tell the operator when the model route is down.
+
+    The scan's findings and state are already on disk — they are written as they
+    are produced — so the checkpoint re-flushes the run record (status
+    ``model_outage``) and drops an explicit outage marker next to it, then
+    notifies the operator through the desktop. Nothing is deleted: the run stays
+    resumable with ``strix --resume <name>``.
+    """
+    from datetime import UTC, datetime
+
+    from strix.report.writer import write_run_record
+
+    logger.error(
+        "MODEL OUTAGE on scan %s: %s after %d consecutive failures on the emergency "
+        "route; checkpointing and notifying the operator",
+        scan_id,
+        controller.emergency,
+        decision.failures,
+    )
+    checkpoint = {
+        "scan_id": scan_id,
+        "reason": "model_outage",
+        "primary_model": controller.primary,
+        "emergency_model": controller.emergency,
+        "failover_state": controller.snapshot(),
+        "at": datetime.now(UTC).isoformat(),
+        "message": (
+            "Both the primary and the emergency model routes are unreachable. The scan "
+            f"has stopped and its findings are preserved in {run_dir}. Resume with "
+            f"'strix --resume {scan_id}' once the model endpoint is reachable."
+        ),
+    }
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "model_outage.json").write_text(
+            json.dumps(checkpoint, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        logger.exception("writing the model-outage checkpoint failed")
+
+    report_state = get_global_report_state()
+    if report_state is not None:
+        _note_exit_reason("model_outage")
+        with contextlib.suppress(Exception):
+            report_state.save_run_data(status="model_outage")
+        with contextlib.suppress(Exception):
+            run_record = dict(report_state.run_record)
+            run_record["status"] = "model_outage"
+            write_run_record(run_dir, run_record)
+
+    notify_operator(
+        "Strix scan stopped: model outage",
+        f"Both {controller.primary} and {controller.emergency} are unreachable. "
+        f"Findings preserved in {run_dir}.",
+    )
 
 
 def _persist_mcp_status(roster: list[dict[str, Any]]) -> None:
@@ -404,7 +505,7 @@ async def run_strix_scan(
         )
         run_config = RunConfig(
             model=resolved_model,
-            model_provider=StrixProvider(),
+            model_provider=_model_provider(settings, resolved_model, scan_id, run_dir),
             model_settings=model_settings,
             sandbox=SandboxRunConfig(client=bundle["client"], session=bundle["session"]),
             trace_include_sensitive_data=False,

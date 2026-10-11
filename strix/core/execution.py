@@ -29,6 +29,14 @@ from strix.core.hooks import (
     SubagentBudgetReservedError,
 )
 from strix.core.inputs import child_initial_input
+from strix.core.loop_recovery import (
+    LoopRecoveryController,
+    LoopSignal,
+    RecoveryAdapter,
+    ThinkingLoopDetector,
+    apply_recovery,
+    open_replacement_session,
+)
 from strix.core.sessions import (
     enforce_image_budget,
     open_agent_session,
@@ -72,6 +80,14 @@ _IMAGE_REJECTION = re.compile(
 )
 _MAX_COMPACTIONS_PER_CYCLE = 2
 
+# Ceiling on session replacements across one agent loop. Each replacement opens a
+# session whose own recovery budget starts over, so without this a model that
+# loops on every session would spin forever. Past it the agent settles the same
+# way recovery exhaustion does: parks when interactive, fails when autonomous.
+_MAX_SESSION_REPLACEMENTS = 5
+
+_LOOP_RECOVERY_KEY = "loop_recovery"
+
 
 @cache
 def _teardown_sandbox_errors() -> tuple[type[BaseException], ...]:
@@ -88,6 +104,75 @@ def _teardown_sandbox_errors() -> tuple[type[BaseException], ...]:
 
 class ProviderRefusalError(AgentsException):
     """Raised when a provider returns a structured refusal instead of an exception."""
+
+
+class ThinkingLoopError(Exception):
+    """Raised when a turn's stream degenerates into a thinking loop.
+
+    Carries the detector's evidence and the stalled stream so the recovery
+    ladder can interrupt it and decide the next step. It is deliberately not an
+    ``AgentsException``: it is an execution-control signal, not a model or
+    provider failure, and must never be folded into the generic crash handling.
+    """
+
+    def __init__(self, signal: LoopSignal, stream: Any) -> None:
+        super().__init__(f"thinking loop detected: {signal.describe()}")
+        self.signal = signal
+        self.stream = stream
+
+
+def _cancel_stream(stream: Any) -> None:
+    """Cancel a stalled stream, tolerating a stream that is already settled."""
+    cancel = getattr(stream, "cancel", None)
+    if cancel is None:
+        return
+    with contextlib.suppress(Exception):
+        cancel(mode="immediate")
+
+
+def _text_fragment(event: Any) -> str | None:
+    """The text a raw stream event adds, or None when it adds none.
+
+    Both the visible answer and the reasoning summary are observed: a looping
+    model spams whichever channel it is currently on, and the operator's own
+    symptom (tiny ``Let me wait`` / ``Go`` fragments) appears on both.
+    """
+    if getattr(event, "type", None) != "raw_response_event":
+        return None
+    data = getattr(event, "data", None)
+    data_type = getattr(data, "type", "")
+    if not isinstance(data_type, str) or "delta" not in data_type:
+        return None
+    delta = getattr(data, "delta", None)
+    return delta if isinstance(delta, str) and delta else None
+
+
+def _run_stream_events(stream: Any, detector: ThinkingLoopDetector | None) -> Any:
+    """Iterate a run's events, feeding the loop detector and raising on a loop.
+
+    Kept as a plain async generator so both the streaming loop and its tests use
+    one implementation: an event that carries a fragment is observed, any other
+    event (a tool call, a message, a completed response) counts as progress and
+    closes the burst.
+    """
+
+    async def _iterate() -> Any:
+        async for event in stream.stream_events():
+            if detector is None:
+                yield event
+                continue
+            fragment = _text_fragment(event)
+            if fragment is None:
+                detector.note_progress()
+                yield event
+                continue
+            signal = detector.observe(detector.clock(), fragment)
+            if signal is not None:
+                _cancel_stream(stream)
+                raise ThinkingLoopError(signal, stream)
+            yield event
+
+    return _iterate()
 
 
 def _structured_provider_refusal(result: Any) -> str | None:
@@ -531,6 +616,57 @@ async def respawn_subagents(
 _INTERACTIVE_TOOL_RECOVERY_LIMIT = 3
 
 
+async def _one_run_cycle(
+    agent: Any,
+    coordinator: AgentCoordinator,
+    agent_id: str,
+    *,
+    input_data: Any,
+    run_config: RunConfig,
+    context: dict[str, Any],
+    max_turns: int,
+    session: Session | None,
+    interactive: bool,
+    event_sink: StreamEventSink | None,
+    hooks: RunHooks[dict[str, Any]] | None,
+    loop_detector: ThinkingLoopDetector | None = None,
+) -> RunResultBase | None:
+    """Run one cycle on the path its mode requires.
+
+    Interactive runs park on any error instead of killing the runner; an
+    autonomous run's error ends the agent. Keeping the choice here leaves the
+    lifecycle loop reading as one sequence of decisions.
+    """
+    if interactive:
+        return await _run_cycle_parked(
+            agent,
+            coordinator,
+            agent_id,
+            input_data=input_data,
+            run_config=run_config,
+            context=context,
+            max_turns=max_turns,
+            session=session,
+            event_sink=event_sink,
+            hooks=hooks,
+            loop_detector=loop_detector,
+        )
+    return await _run_cycle(
+        agent,
+        coordinator,
+        agent_id,
+        input_data=input_data,
+        run_config=run_config,
+        context=context,
+        max_turns=max_turns,
+        session=session,
+        interactive=False,
+        event_sink=event_sink,
+        hooks=hooks,
+        loop_detector=loop_detector,
+    )
+
+
 async def _run_until_lifecycle(
     agent: Any,
     coordinator: AgentCoordinator,
@@ -560,6 +696,9 @@ async def _run_until_lifecycle(
     input_data: Any = initial_input
     recovery_limit = _INTERACTIVE_TOOL_RECOVERY_LIMIT if interactive else max(1, max_turns)
     said_to_user = False
+    detector = ThinkingLoopDetector()
+    recovery = LoopRecoveryController()
+    replacements = 0
 
     while True:
         if coordinator.budget_stopped:
@@ -571,33 +710,51 @@ async def _run_until_lifecycle(
             raise SubagentBudgetReservedError("scan reached the sub-agent budget reserve")
 
         try:
-            if interactive:
-                result = await _run_cycle_parked(
-                    agent,
-                    coordinator,
+            result = await _one_run_cycle(
+                agent,
+                coordinator,
+                agent_id,
+                input_data=input_data,
+                run_config=run_config,
+                context=context,
+                max_turns=max_turns,
+                session=session,
+                interactive=interactive,
+                event_sink=event_sink,
+                hooks=hooks,
+                loop_detector=detector,
+            )
+        except ThinkingLoopError as exc:
+            detector.reset()
+            if replacements >= _MAX_SESSION_REPLACEMENTS:
+                logger.warning(
+                    "agent %s stalled in a thinking loop again after %d session "
+                    "replacement(s); settling it instead of replacing forever",
                     agent_id,
-                    input_data=input_data,
-                    run_config=run_config,
-                    context=context,
-                    max_turns=max_turns,
-                    session=session,
-                    event_sink=event_sink,
-                    hooks=hooks,
+                    replacements,
                 )
-            else:
-                result = await _run_cycle(
-                    agent,
-                    coordinator,
-                    agent_id,
-                    input_data=input_data,
-                    run_config=run_config,
-                    context=context,
-                    max_turns=max_turns,
-                    session=session,
-                    interactive=False,
-                    event_sink=event_sink,
-                    hooks=hooks,
+                return await _exhausted_recovery(
+                    coordinator, agent_id, None, interactive=interactive
                 )
+            outcome = recovery.on_loop(exc.signal)
+            logger.warning(
+                "agent %s loop recovery step '%s' (%s)",
+                agent_id,
+                outcome.action,
+                exc.signal.describe(),
+            )
+            session, replacements = await _recover_from_loop(
+                outcome=outcome,
+                agent=agent,
+                coordinator=coordinator,
+                agent_id=agent_id,
+                session=session,
+                run_config=run_config,
+                interactive=interactive,
+                replacements=replacements,
+            )
+            input_data = []
+            continue
         except BudgetPausedError as exc:
             if coordinator.budget_policy != "pause":
                 raise
@@ -624,6 +781,8 @@ async def _run_until_lifecycle(
         )
         status = await _agent_status(coordinator, agent_id)
         if status != "running" and not silent_yield:
+            detector.reset()
+            recovery.note_progress()
             await coordinator.reset_recovery(agent_id)
             return result
 
@@ -648,6 +807,110 @@ async def _run_until_lifecycle(
             interactive=interactive,
             silent_yield=silent_yield,
         )
+
+
+async def _recover_from_loop(
+    *,
+    outcome: Any,
+    agent: Any,
+    coordinator: AgentCoordinator,
+    agent_id: str,
+    session: Session | None,
+    run_config: RunConfig,
+    interactive: bool,
+    replacements: int,
+) -> tuple[Session | None, int]:
+    """Run one ladder step, returning the (possibly replaced) session.
+
+    The replacement session is opened before the old one is dropped and is
+    attached to the coordinator, so a message queued mid-recovery lands in the
+    session the agent will actually read next. The prior session's history is
+    carried across verbatim: compaction/session replacement must never lose
+    findings or scan state.
+
+    Interactive runs read their mailbox between cycles, so the continuation
+    prompt is queued there. An autonomous run's loop never drains a mailbox, so
+    the prompt is appended straight to its session.
+    """
+
+    async def _send_prompt(prompt: str) -> bool:
+        if interactive:
+            return await coordinator.send(
+                agent_id,
+                {
+                    "from": "system",
+                    "type": "loop_recovery",
+                    "priority": "high",
+                    "content": prompt,
+                },
+                interrupt=False,
+            )
+        if session is None:
+            return False
+        try:
+            await session.add_items(
+                [cast("TResponseInputItem", {"role": "user", "content": prompt})]
+            )
+        except Exception:
+            logger.exception("appending the loop-recovery prompt failed for %s", agent_id)
+            return False
+        return True
+
+    async def _compact() -> bool:
+        if session is None:
+            return False
+        try:
+            return await _compact_session(agent, session, run_config, force=True)
+        except Exception:
+            logger.exception("forced compaction during loop recovery failed for %s", agent_id)
+            return False
+
+    async def _replace() -> Session | None:
+        if session is None:
+            return None
+        new_session = open_replacement_session(session)
+        if new_session is None:
+            logger.warning(
+                "agent %s cannot open a replacement session (no on-disk session db); "
+                "continuing in the current session",
+                agent_id,
+            )
+            return None
+        try:
+            items = list(await session.get_items())
+        except Exception:
+            logger.exception("reading the prior session during replacement failed for %s", agent_id)
+            items = []
+        if items:
+            with contextlib.suppress(Exception):
+                await new_session.add_items(items)
+        await coordinator.attach_runtime(agent_id, session=new_session)
+        # ``Session`` has no ``close`` on the protocol; the concrete SQLite
+        # session does, and leaving it open would leak a file handle per
+        # replacement, so it is closed defensively.
+        with contextlib.suppress(Exception):
+            close = getattr(session, "close", None)
+            if callable(close):
+                close()
+        logger.warning(
+            "agent %s replaced session %s with %s carrying %d item(s)",
+            agent_id,
+            getattr(session, "session_id", "?"),
+            getattr(new_session, "session_id", "?"),
+            len(items),
+        )
+        return new_session
+
+    adapter = RecoveryAdapter(
+        cancel_stream=lambda: None,
+        send_prompt=_send_prompt,
+        compact=_compact,
+        replace_session=_replace,
+    )
+    new_session = await apply_recovery(outcome, adapter)
+    if new_session is not None:
+        return new_session, replacements + 1
+    return session, replacements
 
 
 async def _exhausted_recovery(
@@ -727,6 +990,7 @@ async def _run_cycle_parked(
     session: Session | None,
     event_sink: StreamEventSink | None,
     hooks: RunHooks[dict[str, Any]] | None,
+    loop_detector: ThinkingLoopDetector | None = None,
 ) -> RunResultBase | None:
     """Interactive run cycle that parks on any error instead of killing the runner."""
     try:
@@ -742,8 +1006,13 @@ async def _run_cycle_parked(
             interactive=True,
             event_sink=event_sink,
             hooks=hooks,
+            loop_detector=loop_detector,
         )
     except (BudgetExceededError, BudgetPausedError, SubagentBudgetReservedError):
+        raise
+    except ThinkingLoopError:
+        # Loop recovery is a control signal, not a failure: hand it to the
+        # ladder in ``_run_until_lifecycle`` instead of parking the agent.
         raise
     except Exception as exc:
         logger.exception("error escaped the run cycle for %s; parking as failed", agent_id)
@@ -765,6 +1034,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
     interactive: bool,
     event_sink: StreamEventSink | None,
     hooks: RunHooks[dict[str, Any]] | None,
+    loop_detector: ThinkingLoopDetector | None = None,
 ) -> RunResultBase | None:
     image_strips = 0
     compactions = 0
@@ -800,7 +1070,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
             await coordinator.attach_stream(agent_id, stream)
             try:
                 try:
-                    async for event in stream.stream_events():
+                    async for event in _run_stream_events(stream, loop_detector):
                         if event_sink is not None:
                             try:
                                 event_sink(agent_id, event)
@@ -810,6 +1080,8 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                         raise stream.run_loop_exception
                     if refusal := _structured_provider_refusal(stream):
                         raise ProviderRefusalError(refusal)
+                except ThinkingLoopError:
+                    raise
                 except (BudgetExceededError, BudgetPausedError, SubagentBudgetReservedError):
                     raise
                 except RuntimeError as stream_exc:
@@ -847,6 +1119,13 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
             )
             await coordinator.set_status(agent_id, "stopped")
             await coordinator.trigger_budget_stop()
+            raise
+        except ThinkingLoopError as exc:
+            # The stalled turn's history is salvaged before the ladder runs, so
+            # the interrupt loses nothing the model already produced.
+            if session is not None:
+                await _salvage_stream_to_session(session, pre_run_items, stream, agent_id)
+            logger.warning("agent %s stalled in a thinking loop: %s", agent_id, exc)
             raise
         except Exception as exc:
             if image_strips < 3 and session is not None and _is_image_rejection(exc):
