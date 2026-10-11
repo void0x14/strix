@@ -8,6 +8,7 @@ and the bounded concurrency are exercised without Docker or a real scan.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -511,3 +512,79 @@ def test_supervisor_stop_terminates_running_scans(tmp_path: Path) -> None:
 def test_plan_dataclass_totals() -> None:
     plan = TargetPlan(targets=["a.com", "b.com"], skipped=[(1, "note")])
     assert plan.total_lines == 3
+
+
+# --- resume: a restarted fleet must not redo finished targets -----------------
+
+
+def test_resume_skips_targets_with_a_finished_run(tmp_path: Path) -> None:
+    runs_base = tmp_path / "strix_runs"
+    # target-a finished; target-b never started; target-c was interrupted.
+    for slug, status, end_time in (
+        ("fleet-a.example.com", "completed", "2026-01-01T00:00:00Z"),
+        ("fleet-c.example.com", "interrupted", "2026-01-01T00:00:00Z"),
+    ):
+        run_dir = runs_base / slug
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text(
+            json.dumps({"run_name": slug, "status": status, "end_time": end_time}),
+            encoding="utf-8",
+        )
+
+    started: list[str] = []
+
+    def _launcher(command: list[str], **_kwargs: Any) -> _FakeProcess:
+        started.append(command[-1])
+        return _FakeProcess(exit_after=0)
+
+    # Resume on: the finished targets are skipped, the rest run.
+    resumed = fleet_module.FleetSupervisor(
+        targets=["a.example.com", "b.example.com", "c.example.com"],
+        scan_command=lambda target, _log_path: ["echo", target],
+        environment={"A": "1"},
+        runs_base=runs_base,
+        concurrency=1,
+        per_scan_bytes=DEFAULT_PER_SCAN_BYTES,
+        memory_floor_bytes=DEFAULT_MEMORY_FLOOR_BYTES,
+        memory_reader=lambda: 64 * GIB,
+        launcher=_launcher,
+        clock=_FakeClock(),
+        sleep=lambda _s: None,
+        console=_QuietConsole(),
+        resume=True,
+    )
+    result = resumed.run()
+
+    # a.example.com and c.example.com are already settled and must not rerun.
+    assert started == ["b.example.com"]
+    statuses = {job.target: job.status() for job in result.jobs}
+    assert statuses["a.example.com"] == "skipped"
+    assert statuses["c.example.com"] == "skipped"
+    assert statuses["b.example.com"] == "exit 0"
+
+
+def test_without_resume_a_finished_target_is_rerun(tmp_path: Path) -> None:
+    """The default is unchanged: a plain launch scans every target."""
+    runs_base = tmp_path / "strix_runs"
+    run_dir = runs_base / "fleet-a.example.com"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        json.dumps({"status": "completed", "end_time": "2026-01-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    started: list[str] = []
+
+    def _launcher(command: list[str], **_kwargs: Any) -> _FakeProcess:
+        started.append(command[-1])
+        return _FakeProcess(exit_after=0)
+
+    supervisor = _supervisor(
+        tmp_path,
+        targets=["a.example.com"],
+        concurrency=1,
+        memory_reader=lambda: 64 * GIB,
+        launcher=_launcher,
+    )
+    supervisor._runs_base = runs_base
+    supervisor.run()
+    assert started == ["a.example.com"]

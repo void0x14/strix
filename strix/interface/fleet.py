@@ -22,6 +22,7 @@ are untouched.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -59,6 +60,11 @@ _POLL_INTERVAL_S = 2.0
 # Time a scan is given to exit after a stop request before it is killed.
 _STOP_GRACE_S = 30.0
 _DEFAULT_VIEWER_PORT = 8787
+
+# A run record in one of these states has ended; --resume skips such targets.
+_TERMINAL_RUN_STATUSES = frozenset(
+    {"completed", "stopped", "failed", "interrupted", "model_outage"}
+)
 # How long to wait for the viewer to start listening before giving up on it.
 _VIEWER_READY_TIMEOUT_S = 20.0
 
@@ -71,6 +77,7 @@ class ScanJob:
     target: str
     slug: str
     slot: int = -1
+    already_done: bool = False
     process: subprocess.Popen[bytes] | None = None
     log_path: Path | None = None
     started_at: float | None = None
@@ -86,6 +93,8 @@ class ScanJob:
         return self.process is not None and self.process.poll() is not None
 
     def status(self) -> str:
+        if self.already_done:
+            return "skipped"
         if self.process is None:
             return "pending"
         if self.running:
@@ -136,6 +145,7 @@ class FleetSupervisor:
         sleep: Callable[[float], Any] = time.sleep,
         run_names: list[str] | None = None,
         on_slot_started: Callable[[int, str], None] | None = None,
+        resume: bool = False,
         console: Console | None = None,
     ) -> None:
         self._targets = list(targets)
@@ -156,8 +166,33 @@ class FleetSupervisor:
         self.jobs = [
             ScanJob(index=i, target=target, slug=names[i]) for i, target in enumerate(self._targets)
         ]
+        if resume:
+            self._skip_already_scanned()
         self._free_slots = list(range(self._concurrency))
         self._slot_of: dict[int, int] = {}
+
+    def _skip_already_scanned(self) -> None:
+        """Mark targets whose run already reached a terminal state as done.
+
+        A restarted fleet must not redo work: a target whose own run directory
+        already holds a finished record is skipped, so picking up after a
+        restart continues the remaining targets instead of starting over. A run
+        that is still in progress is left to its own process.
+        """
+        skipped = 0
+        for job in self.jobs:
+            record = self._runs_base / job.slug / "run.json"
+            try:
+                data = json.loads(record.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if data.get("status") in _TERMINAL_RUN_STATUSES and data.get("end_time"):
+                job.already_done = True
+                job.returncode = 0
+                skipped += 1
+        if skipped:
+            logger.info("resume: %d target(s) already have a finished run; skipping them", skipped)
+            self._console.print(f"[dim]resume: skipping {skipped} already-finished target(s)[/]")
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -170,7 +205,7 @@ class FleetSupervisor:
     def run(self) -> FleetResult:
         """Drive the fleet to completion; returns every job's final state."""
         self._runs_base.mkdir(parents=True, exist_ok=True)
-        pending = list(self.jobs)
+        pending = [job for job in self.jobs if not job.already_done]
         stalled = False
         try:
             while pending or any(job.running for job in self.jobs):
@@ -338,14 +373,20 @@ def _format_bytes(value: int | None) -> str:
 
 
 class FleetViewer:
-    """Serve one viewer over a single run directory.
+    """Serve one run directory; its target can be swapped without a restart.
 
     ``serve()`` takes the run it opens by default; every *other* run under the
     same ``strix_runs`` root is part of the email-gated history, so a viewer
-    pointed at one run can only show that run to an unverified browser. The fleet
-    therefore runs one viewer per concurrency slot (see :class:`FleetViewers`),
-    each pointed at the run of the scan currently occupying that slot, so every
-    live target is watchable from the web with no verification step.
+    pointed at one run can only show that run to an unverified browser. The
+    fleet therefore runs one viewer per concurrency slot (see
+    :class:`FleetViewers`), each pointed at the run of the scan currently
+    occupying that slot, so every live target is watchable from the web with no
+    verification step.
+
+    Changing which run a slot shows must not restart the server: the session
+    capability is minted per process, so a restart mints a new token and every
+    URL the operator already has open starts answering 403. The server is
+    started once and only its served run is retargeted.
     """
 
     def __init__(
@@ -356,16 +397,16 @@ class FleetViewer:
         port: int,
         open_browser: bool,
     ) -> None:
-        self._run_dir = run_dir
         self._host = host
         self._port = port
         self._open_browser = open_browser
         self._httpd: Any = None
         self.url: str | None = None
         self.authorized_url: str | None = None
+        self.run_name = run_dir.name
 
-    def start(self) -> bool:
-        """Start the viewer; return whether it is serving.
+    def start(self, run_dir: Path) -> bool:
+        """Start the viewer on ``run_dir``; return whether it is serving.
 
         A viewer that cannot start is not fatal: the scans are the work, and the
         operator can attach one later with ``strix view``.
@@ -380,39 +421,59 @@ class FleetViewer:
             logger.warning("viewer bundle is not built; skipping the web view")
             return False
         try:
-            self._run_dir.mkdir(parents=True, exist_ok=True)
+            run_dir.mkdir(parents=True, exist_ok=True)
             self._httpd, self.url, token = serve(
-                self._run_dir,
+                run_dir,
                 host=self._host,
                 port=self._port,
                 open_browser=self._open_browser,
             )
         except Exception:
-            logger.exception("could not start the viewer for %s", self._run_dir)
+            logger.exception("could not start the viewer for %s", run_dir)
             self._httpd = None
             return False
         self.authorized_url = authorized_url(self.url, token)
+        self.run_name = run_dir.name
         return True
 
+    def retarget(self, run_dir: Path) -> bool:
+        """Point an already-running viewer at another run, token intact."""
+        state = getattr(self._httpd, "viewer_state", None) if self._httpd else None
+        if state is None:
+            return self.start(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        state.retarget(run_dir)
+        self.run_name = run_dir.name
+        return True
+
+    @property
+    def running(self) -> bool:
+        return self._httpd is not None
+
     def stop(self) -> None:
-        if self._httpd is None:
+        httpd = self._httpd
+        if httpd is None:
             return
+        self._httpd = None
         try:
-            self._httpd.shutdown()
-            self._httpd.server_close()
+            httpd.shutdown()
+            thread = getattr(httpd, "viewer_thread", None)
+            if thread is not None:
+                thread.join(timeout=5)
+            httpd.server_close()
         except Exception:  # noqa: BLE001 - shutdown is best-effort
             logger.debug("viewer shutdown failed", exc_info=True)
-        self._httpd = None
 
 
 class FleetViewers:
-    """One viewer per concurrency slot, on a fixed port each.
+    """One long-lived viewer per concurrency slot, on a fixed port each.
 
-    A slot's viewer is (re)pointed at the run of whichever scan currently holds
-    the slot. The port is fixed for the slot's lifetime, so the operator's open
-    tab keeps a stable URL across the whole fleet run; only its content changes
-    as scans come and go. With ``concurrency`` slots there are at most
-    ``concurrency`` viewers, so the fleet never opens a port per target.
+    A slot's viewer is started once and then *retargeted* at the run of whichever
+    scan currently holds the slot. Because the server is never restarted, the
+    port and the session token are stable for the whole fleet run: the operator
+    opens each slot's URL once and its page follows the slot's current scan for
+    hours. With ``concurrency`` slots there are at most ``concurrency`` viewers,
+    so the fleet never opens a port per target.
     """
 
     def __init__(
@@ -437,18 +498,19 @@ class FleetViewers:
     def point_at(self, slot: int, run_dir: Path) -> str | None:
         """Point ``slot``'s viewer at ``run_dir``; return its authorized URL."""
         slot = slot % self._slots
-        previous = self._viewers.pop(slot, None)
-        if previous is not None:
-            previous.stop()
-        viewer = FleetViewer(
-            run_dir,
-            host=self._host,
-            port=self.port_for(slot),
-            open_browser=self._open_browser and not self._viewers,
-        )
-        if not viewer.start():
+        viewer = self._viewers.get(slot)
+        if viewer is None:
+            viewer = FleetViewer(
+                run_dir,
+                host=self._host,
+                port=self.port_for(slot),
+                open_browser=self._open_browser and not self._viewers,
+            )
+            if not viewer.start(run_dir):
+                return None
+            self._viewers[slot] = viewer
+        elif not viewer.retarget(run_dir):
             return None
-        self._viewers[slot] = viewer
         return viewer.authorized_url
 
     def urls(self) -> dict[int, str]:
@@ -520,6 +582,15 @@ def build_parser() -> argparse.ArgumentParser:
             f"Directory the fleet's {RUNS_DIR_NAME} tree lives in (default: the current "
             f"directory). The runs themselves always land under <DIR>/{RUNS_DIR_NAME}, "
             "which is where the scans write and the live views read."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Skip targets whose run directory already holds a finished run, and "
+            "scan only the rest. Use this to pick up a fleet after a restart "
+            "without redoing finished targets."
         ),
     )
     parser.add_argument(
@@ -672,6 +743,7 @@ def run_fleet(argv: list[str]) -> int:
         memory_floor_bytes=_memory_floor_bytes(),
         run_names=run_names,
         on_slot_started=on_slot_started if not args.no_viewer else None,
+        resume=args.resume,
         console=console,
     )
     previous_handlers = _install_signal_handlers(supervisor)

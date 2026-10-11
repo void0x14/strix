@@ -143,6 +143,18 @@ class _ViewerState:
         # after this state is constructed); see SESSION_COOKIE_PREFIX.
         self.cookie_name = SESSION_COOKIE_PREFIX
 
+    def retarget(self, run_dir: Path) -> None:
+        """Serve a different run without disturbing this server's session.
+
+        The session capability is minted per process, so restarting a viewer to
+        change which run it shows mints a new token and invalidates every URL
+        the operator already has open. Swapping only the served run keeps the
+        token, the cookie and the port intact, so an open tab follows the new
+        run instead of being logged out.
+        """
+        self.run_dir = run_dir
+        self.base_dir = run_dir.parent
+
 
 def _make_handler(state: _ViewerState) -> type[BaseHTTPRequestHandler]:
     class ViewerHandler(BaseHTTPRequestHandler):
@@ -579,6 +591,10 @@ def serve(
     ``steer_handler`` is supplied only by the in-TUI launcher, which runs inside
     the live scan process and can forward a message to a running agent. Left
     ``None`` (standalone ``strix view``), steering is reported unavailable.
+
+    The returned ``httpd`` carries ``viewer_state`` and ``viewer_thread``, so a
+    long-running caller (the fleet) can retarget the served run — see
+    ``_ViewerState.retarget`` — or join the server thread on shutdown.
     """
     assets_dir = bundle_dir()
     state = _ViewerState(run_dir=run_dir, assets_dir=assets_dir, steer_handler=steer_handler)
@@ -603,6 +619,8 @@ def serve(
     if open_browser:
         _open_browser(authorized_url(url, state.session_token))
 
+    httpd.viewer_state = state  # type: ignore[attr-defined]
+    httpd.viewer_thread = thread  # type: ignore[attr-defined]
     return httpd, url, state.session_token
 
 
